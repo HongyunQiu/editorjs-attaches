@@ -1,9 +1,19 @@
 .cdx-attaches {
-  --color-line: #EFF0F1;
-  --color-bg: #fff;
-  --color-bg-secondary: #F8F8F8;
-  --color-bg-secondary--hover: #f2f2f2;
-  --color-text-secondary: #707684;
+  /**
+   * QNotes 深浅色主题适配：
+   * - 优先映射到宿主的全局变量（--surface/--border/--text-muted/...）
+   * - 必须带 fallback，确保脱离 QNotes 也能正常显示
+   */
+  --color-line: var(--border, #EFF0F1);
+  --color-bg: var(--surface, #fff);
+  --color-bg-secondary: var(--control-bg, #F8F8F8);
+  --color-bg-secondary--hover: var(--control-bg-hover, #f2f2f2);
+  --color-text-secondary: var(--text-muted, #707684);
+  --color-text: var(--text, #1f2937);
+  --color-button-text: var(--control-text, #000);
+  --color-button-bg: var(--control-bg, #f3f4f6);
+  --color-button-bg-hover: var(--control-bg-hover, #e5e7eb);
+  --color-placeholder: var(--text-muted, #7b7e89);
 
   &--with-file {
     display: flex;
@@ -45,7 +55,8 @@
       position: relative;
 
       &-background {
-        background-color: #333;
+        /* 默认“文件图标底色”：保持中性深色，避免浅色/深色模式下过亮刺眼 */
+        background-color: var(--cdx-attaches-fileicon-bg, #333);
 
         width: 27px;
         height: 30px;
@@ -68,7 +79,7 @@
         background: inherit;
         text-transform: uppercase;
         line-height: 1em;
-        color: #fff;
+        color: var(--cdx-attaches-fileicon-label, #fff);
         padding: 1px 2px;
         border-radius: 3px;
         font-size: 10px;
@@ -84,7 +95,7 @@
       }
 
       & path {
-        stroke: #fff;
+        stroke: var(--cdx-attaches-fileicon-label, #fff);
       }
     }
 
@@ -112,7 +123,7 @@
 
     ^&__title:empty::before {
       content: attr(data-placeholder);
-      color: #7b7e89;
+      color: var(--color-placeholder);
     }
   }
 
@@ -131,9 +142,15 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    color: #000;
+    color: var(--color-button-text);
+    background: var(--color-button-bg);
+    border: 1px solid var(--color-line);
     border-radius: 7px;
     font-weight: 500;
+
+    &:hover {
+      background: var(--color-button-bg-hover);
+    }
 
     svg {
       margin-top: 0;

@@ -62,6 +62,97 @@ const LOADER_TIMEOUT = 500;
  */
 export default class AttachesTool {
   /**
+   * Safe decode for percent-encoded strings (e.g. from URLs).
+   *
+   * @param {string} s
+   * @returns {string}
+   */
+  static decodeURIComponentSafe(s) {
+    if (typeof s !== 'string') return '';
+    try {
+      return decodeURIComponent(s);
+    } catch (e) {
+      return s;
+    }
+  }
+
+  /**
+   * Try to repair common mojibake ("æµ‹è¯•.txt" -> "测试.txt") in browser.
+   * Only applies when the string has latin1-supplement chars and no CJK.
+   *
+   * @param {string} s
+   * @returns {string}
+   */
+  static repairLatin1Mojibake(s) {
+    if (typeof s !== 'string') return '';
+    const trimmed = s.trim();
+    if (!trimmed) return '';
+
+    const hasCJK = /[\u4e00-\u9fff]/.test(trimmed);
+    if (hasCJK) return trimmed;
+
+    const hasLatin1 = /[\u00C0-\u00FF]/.test(trimmed);
+    if (!hasLatin1) return trimmed;
+
+    if (typeof TextDecoder === 'undefined') return trimmed;
+
+    try {
+      const bytes = Uint8Array.from(Array.from(trimmed, (ch) => ch.charCodeAt(0) & 0xff));
+      const decoded = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+
+      if (/[\u4e00-\u9fff]/.test(decoded) && !decoded.includes('\uFFFD')) {
+        return decoded;
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    return trimmed;
+  }
+
+  /**
+   * Derive a reasonable default title for the attachment.
+   * Prefer backend-provided name, otherwise fallback to url's last segment.
+   *
+   * @param {object} file - uploaded file data
+   * @returns {string}
+   */
+  static deriveTitleFromFile(file) {
+    if (!file || typeof file !== 'object') {
+      return '';
+    }
+
+    const normalize = (val) => {
+      if (typeof val !== 'string') return '';
+      const trimmed = val.trim();
+      if (!trimmed) return '';
+      // try decode percent-encoding first, then repair mojibake if needed
+      return AttachesTool.repairLatin1Mojibake(AttachesTool.decodeURIComponentSafe(trimmed));
+    };
+
+    if (typeof file.title === 'string' && file.title.trim() !== '') {
+      return normalize(file.title);
+    }
+
+    if (typeof file.name === 'string' && file.name.trim() !== '') {
+      return normalize(file.name);
+    }
+
+    if (typeof file.url === 'string' && file.url.trim() !== '') {
+      try {
+        const url = file.url.trim();
+        const cleanUrl = url.split('#')[0].split('?')[0];
+        const last = cleanUrl.split('/').pop();
+
+        return normalize(last || '');
+      } catch (e) {
+        return '';
+      }
+    }
+
+    return '';
+  }
+  /**
    * @param {object} options - tool constructor options
    * @param {AttachesToolData} [options.data] - previously saved data
    * @param {AttachesToolConfig} options.config - user defined config
@@ -312,9 +403,11 @@ export default class AttachesTool {
 
     try {
       if (body.success && body.file !== undefined && !isEmpty(body.file)) {
+        const derivedTitle = AttachesTool.deriveTitleFromFile(body.file);
+
         this.data = {
           file: body.file,
-          title: body.file.title || '',
+          title: derivedTitle,
         };
 
         this.nodes.button.remove();
@@ -476,9 +569,13 @@ export default class AttachesTool {
    * @param {AttachesToolData} data - data to set
    */
   set data({ file, title }) {
+    const safeTitle = (typeof title === 'string' && title.trim() !== '')
+      ? title
+      : AttachesTool.deriveTitleFromFile(file);
+
     this._data = {
       file,
-      title,
+      title: safeTitle,
     };
   }
 }

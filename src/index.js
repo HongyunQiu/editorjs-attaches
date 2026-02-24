@@ -167,6 +167,7 @@ export default class AttachesTool {
       wrapper: null,
       button: null,
       title: null,
+      parseButton: null,
     };
 
     this._data = {
@@ -182,6 +183,12 @@ export default class AttachesTool {
       errorMessage: config.errorMessage || 'File upload failed',
       uploader: config.uploader || undefined,
       additionalRequestHeaders: config.additionalRequestHeaders || {},
+      // QNotes 扩展：PDF 解析（Docling）
+      parseEndpoint: config.parseEndpoint || '',
+      parseButtonText: config.parseButtonText || '解析',
+      parseLoadingText: config.parseLoadingText || '解析中…',
+      parseErrorMessage: config.parseErrorMessage || '解析失败',
+      parseRequestHeaders: config.parseRequestHeaders || config.additionalRequestHeaders || {},
     };
 
     if (data !== undefined && !isEmpty(data)) {
@@ -198,6 +205,7 @@ export default class AttachesTool {
     });
 
     this.enableFileUpload = this.enableFileUpload.bind(this);
+    this.onParsePdfClick = this.onParsePdfClick.bind(this);
   }
 
   /**
@@ -243,11 +251,26 @@ export default class AttachesTool {
       title: 'cdx-attaches__title',
       size: 'cdx-attaches__size',
       downloadButton: 'cdx-attaches__download-button',
+      parseButton: 'cdx-attaches__parse-button',
       fileInfo: 'cdx-attaches__file-info',
       fileIcon: 'cdx-attaches__file-icon',
       fileIconBackground: 'cdx-attaches__file-icon-background',
       fileIconLabel: 'cdx-attaches__file-icon-label',
     };
+  }
+
+  /**
+   * Returns true if the current attachment is a PDF.
+   * @returns {boolean}
+   */
+  isPdfAttachment() {
+    try {
+      const f = this.data && this.data.file ? this.data.file : {};
+      const ext = (f.extension || getExtensionFromFileName(f.name) || '').toString().trim().replace('.', '').toLowerCase();
+      return ext === 'pdf';
+    } catch (e) {
+      return false;
+    }
   }
 
   /**
@@ -529,6 +552,21 @@ export default class AttachesTool {
 
     this.nodes.wrapper.appendChild(fileInfo);
 
+    // QNotes 扩展：如果是 PDF，显示“解析”按钮（由服务端调用 Docling，返回 blocks 后插入当前笔记）
+    try {
+      const canParse = !this.readOnly && this.isPdfAttachment() && typeof this.config.parseEndpoint === 'string' && this.config.parseEndpoint.trim() !== '';
+      if (canParse) {
+        this.nodes.parseButton = make('button', this.CSS.parseButton, {
+          type: 'button',
+          textContent: this.config.parseButtonText || '解析',
+        });
+        this.nodes.parseButton.addEventListener('click', this.onParsePdfClick);
+        this.nodes.wrapper.appendChild(this.nodes.parseButton);
+      }
+    } catch (e) {
+      // ignore UI errors
+    }
+
     if (file.url !== undefined) {
       const downloadIcon = make('a', this.CSS.downloadButton, {
         innerHTML: IconChevronDown,
@@ -537,6 +575,110 @@ export default class AttachesTool {
       });
 
       this.nodes.wrapper.appendChild(downloadIcon);
+    }
+  }
+
+  /**
+   * Parse current PDF attachment into Editor.js blocks via QNotes backend.
+   */
+  async onParsePdfClick() {
+    if (this._isParsingPdf) return;
+    this._isParsingPdf = true;
+
+    const btn = this.nodes.parseButton;
+    const prevText = btn ? btn.textContent : '';
+    try {
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = this.config.parseLoadingText || '解析中…';
+      }
+
+      const parseEndpoint = (this.config.parseEndpoint || '').toString().trim();
+      if (!parseEndpoint) throw new Error(this.config.parseErrorMessage || '解析失败');
+
+      // 当前笔记 ID：由 QNotes 前端全局状态提供
+      const noteId = (window.QNotesApp && window.QNotesApp.state) ? window.QNotesApp.state.currentNoteId : null;
+      if (!noteId) throw new Error('未找到当前笔记（note_id）');
+
+      const blockIndex = this.api.blocks.getCurrentBlockIndex();
+      if (typeof blockIndex !== 'number' || blockIndex < 0) throw new Error('无法定位当前块');
+
+      const headers = {
+        ...(this.config.parseRequestHeaders || {}),
+        'Content-Type': 'application/json',
+      };
+
+      const resp = await fetch(parseEndpoint, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          note_id: noteId,
+          block_index: blockIndex,
+          mode: 'sync',
+          // 默认等待 120s；可由后端根据 max_wait_seconds 约束
+          max_wait_seconds: 120,
+        }),
+      });
+
+      const json = await resp.json().catch(() => null);
+      if (!resp.ok) {
+        const msg = (json && (json.error || json.message)) ? (json.error || json.message) : (this.config.parseErrorMessage || '解析失败');
+        throw new Error(msg);
+      }
+
+      // async fallback（202）：仅返回 task_id
+      if (resp.status === 202 && json && json.task_id && !json.blocks) {
+        this.api.notifier.show({
+          message: `解析任务已提交：${json.task_id}`,
+          style: 'success',
+        });
+        return;
+      }
+
+      const blocks = json && Array.isArray(json.blocks) ? json.blocks : [];
+      if (!blocks.length) {
+        const msg = (json && json.error) ? String(json.error) : '解析结果为空';
+        throw new Error(msg);
+      }
+
+      // 插入到当前附件块之后
+      let insertIndex = blockIndex + 1;
+      for (const b of blocks) {
+        if (!b || typeof b !== 'object') continue;
+        if (!b.type || typeof b.type !== 'string') continue;
+        const data = (b.data && typeof b.data === 'object') ? b.data : {};
+        try {
+          this.api.blocks.insert(b.type, data, undefined, insertIndex, false);
+          insertIndex += 1;
+        } catch (e) {
+          // 单个 block 插入失败：跳过并继续
+          console.warn('Insert block failed:', e);
+        }
+      }
+
+      // 标记变更
+      try {
+        this.api.blocks.getBlockByIndex(blockIndex).dispatchChange();
+      } catch (e) {
+        // ignore
+      }
+
+      this.api.notifier.show({
+        message: 'PDF 解析完成，已插入到笔记中',
+        style: 'success',
+      });
+    } catch (e) {
+      const msg = e && e.message ? e.message : (this.config.parseErrorMessage || '解析失败');
+      this.api.notifier.show({
+        message: msg,
+        style: 'error',
+      });
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = prevText || (this.config.parseButtonText || '解析');
+      }
+      this._isParsingPdf = false;
     }
   }
 

@@ -62,6 +62,86 @@ const LOADER_TIMEOUT = 500;
  */
 export default class AttachesTool {
   /**
+   * Make a safe filename for common filesystems (Windows/macOS/Linux).
+   * - strips control chars
+   * - replaces invalid filename chars with '_'
+   * - trims trailing dots/spaces (Windows)
+   * - avoids reserved device names (Windows)
+   *
+   * @param {string} name
+   * @param {string} fallbackBase
+   * @returns {string}
+   */
+  static sanitizeFileName(name, fallbackBase = 'attachment') {
+    const raw = (typeof name === 'string' ? name : '').toString();
+
+    const cleaned = raw
+      .replace(/[\u0000-\u001F\u007F]/g, '') // control chars
+      .replace(/[<>:"/\\|?*]/g, '_') // Windows-invalid filename chars
+      .replace(/\s+/g, ' ')
+      .trim()
+      .replace(/[. ]+$/g, ''); // Windows: no trailing dot/space
+
+    const base = cleaned || fallbackBase;
+
+    // Windows reserved device names (case-insensitive)
+    const upper = base.toUpperCase();
+    const isReserved = (
+      upper === 'CON' || upper === 'PRN' || upper === 'AUX' || upper === 'NUL' ||
+      /^COM[1-9]$/.test(upper) || /^LPT[1-9]$/.test(upper)
+    );
+
+    const safe = isReserved ? `_${base}` : base;
+
+    // Keep filename reasonably short to avoid filesystem limits; preserve end.
+    const MAX_LEN = 180;
+    return safe.length > MAX_LEN ? safe.slice(0, MAX_LEN).trim().replace(/[. ]+$/g, '') : safe;
+  }
+
+  /**
+   * Build a download filename that matches the tool title.
+   *
+   * @param {AttachesToolData} data
+   * @returns {string}
+   */
+  static buildDownloadFileName(data) {
+    const file = data && data.file ? data.file : {};
+    const rawTitle = (data && typeof data.title === 'string') ? data.title : '';
+
+    const titleText = AttachesTool.repairLatin1Mojibake(
+      AttachesTool.decodeURIComponentSafe(rawTitle.trim())
+    );
+
+    const fallbackTitle = AttachesTool.deriveTitleFromFile(file) || 'attachment';
+    const fallbackExt = getExtensionFromFileName(fallbackTitle).toString().trim().replace(/^\./, '').toLowerCase();
+    const fallbackBase = fallbackExt ? fallbackTitle.slice(0, -(fallbackExt.length + 1)) : fallbackTitle;
+
+    const extHint = (
+      (typeof file.extension === 'string' && file.extension.trim() !== '' ? file.extension : '') ||
+      getExtensionFromFileName(file.name) ||
+      (typeof file.url === 'string' && file.url.trim() !== ''
+        ? getExtensionFromFileName((file.url.split('#')[0].split('?')[0].split('/').pop() || ''))
+        : '')
+    ).toString().trim().replace(/^\./, '').toLowerCase();
+
+    const existingExt = getExtensionFromFileName(titleText).toString().trim().replace(/^\./, '').toLowerCase();
+    const finalExt = existingExt || extHint;
+
+    let basePart = titleText;
+    if (existingExt) {
+      basePart = titleText.slice(0, -(existingExt.length + 1));
+    }
+
+    const safeBase = AttachesTool.sanitizeFileName(
+      basePart,
+      AttachesTool.sanitizeFileName(fallbackBase, 'attachment')
+    );
+    const safeExt = (finalExt && /^[a-z0-9]{1,10}$/i.test(finalExt)) ? finalExt : '';
+
+    return safeExt ? `${safeBase}.${safeExt}` : safeBase;
+  }
+
+  /**
    * Safe decode for percent-encoded strings (e.g. from URLs).
    *
    * @param {string} s
@@ -167,6 +247,7 @@ export default class AttachesTool {
       wrapper: null,
       button: null,
       title: null,
+      download: null,
       parseButton: null,
     };
 
@@ -571,8 +652,27 @@ export default class AttachesTool {
       const downloadIcon = make('a', this.CSS.downloadButton, {
         innerHTML: IconChevronDown,
         href: file.url,
+        download: AttachesTool.buildDownloadFileName(this.data),
         target: '_blank',
       });
+
+      this.nodes.download = downloadIcon;
+
+      /**
+       * Keep download name in sync with edited title.
+       */
+      if (!this.readOnly) {
+        this.nodes.title.addEventListener('input', () => {
+          try {
+            const liveTitle = this.nodes.title ? this.nodes.title.textContent : '';
+            if (this.nodes.download) {
+              this.nodes.download.download = AttachesTool.buildDownloadFileName({ ...this.data, title: liveTitle });
+            }
+          } catch (e) {
+            // ignore
+          }
+        });
+      }
 
       this.nodes.wrapper.appendChild(downloadIcon);
     }

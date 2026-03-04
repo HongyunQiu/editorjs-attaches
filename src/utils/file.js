@@ -5,9 +5,21 @@
  * @returns {string}
  */
 export function getExtensionFromFileName(name) {
-  if (name === undefined) {
+  if (typeof name !== 'string') {
     return '';
   }
 
-  return name.split('.').pop();
+  const trimmed = name.trim();
+  if (!trimmed) return '';
+
+  const lastDot = trimmed.lastIndexOf('.');
+
+  /**
+   * No dot, dot is first char (".gitignore"), or dot is the last char ("file.")
+   */
+  if (lastDot <= 0 || lastDot === trimmed.length - 1) {
+    return '';
+  }
+
+  return trimmed.slice(lastDot + 1);
 }

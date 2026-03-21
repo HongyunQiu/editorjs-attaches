@@ -7,6 +7,271 @@ import { IconChevronDown, IconFile } from '@codexteam/icons';
 
 const LOADER_TIMEOUT = 500;
 
+const ZIP_LOCAL_FILE_HEADER = 0x04034b50;
+const ZIP_CENTRAL_DIRECTORY_HEADER = 0x02014b50;
+const ZIP_END_OF_CENTRAL_DIRECTORY = 0x06054b50;
+const ZIP_COMPRESSION_STORED = 0;
+const ZIP_COMPRESSION_DEFLATE = 8;
+
+function parseXml(xmlText) {
+  if (typeof DOMParser === 'undefined') {
+    throw new Error('Current environment does not support XML parsing');
+  }
+
+  const doc = new DOMParser().parseFromString(String(xmlText || ''), 'application/xml');
+  const parseError = doc.querySelector('parsererror');
+  if (parseError) {
+    throw new Error('Failed to parse table XML');
+  }
+
+  return doc;
+}
+
+function getXmlTextContent(node) {
+  return node ? String(node.textContent || '') : '';
+}
+
+function columnLettersToIndex(letters) {
+  const normalized = String(letters || '').trim().toUpperCase();
+  let value = 0;
+
+  for (const char of normalized) {
+    const code = char.charCodeAt(0);
+    if (code < 65 || code > 90) {
+      return -1;
+    }
+    value = value * 26 + (code - 64);
+  }
+
+  return value > 0 ? value - 1 : -1;
+}
+
+function parseCellReference(ref) {
+  const match = /^([A-Z]+)(\d+)$/.exec(String(ref || '').trim().toUpperCase());
+  if (!match) {
+    return null;
+  }
+
+  const columnIndex = columnLettersToIndex(match[1]);
+  const rowIndex = parseInt(match[2], 10) - 1;
+
+  if (columnIndex < 0 || !Number.isFinite(rowIndex) || rowIndex < 0) {
+    return null;
+  }
+
+  return { rowIndex, columnIndex };
+}
+
+function getCellText(cell, sharedStrings) {
+  if (!cell) {
+    return '';
+  }
+
+  const type = String(cell.getAttribute('t') || '').trim().toLowerCase();
+  const valueNode = cell.querySelector(':scope > v');
+  const rawValue = getXmlTextContent(valueNode).trim();
+
+  if (type === 'inlineStr') {
+    return Array.from(cell.querySelectorAll(':scope > is > t'))
+      .map((node) => getXmlTextContent(node))
+      .join('');
+  }
+
+  if (type === 's') {
+    const sharedIndex = parseInt(rawValue, 10);
+    return Number.isFinite(sharedIndex) && sharedIndex >= 0 && sharedIndex < sharedStrings.length
+      ? String(sharedStrings[sharedIndex] || '')
+      : '';
+  }
+
+  if (type === 'b') {
+    return rawValue === '1' ? 'TRUE' : 'FALSE';
+  }
+
+  return rawValue;
+}
+
+async function inflateRaw(compressedBytes) {
+  if (typeof DecompressionStream === 'undefined') {
+    throw new Error('Current environment does not support .table decompression');
+  }
+
+  const stream = new Blob([compressedBytes]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+  const response = new Response(stream);
+  const buffer = await response.arrayBuffer();
+
+  return new Uint8Array(buffer);
+}
+
+async function readZipEntries(arrayBuffer) {
+  const bytes = new Uint8Array(arrayBuffer);
+  const view = new DataView(arrayBuffer);
+  const decoder = new TextDecoder('utf-8');
+  let eocdOffset = -1;
+
+  for (let offset = bytes.length - 22; offset >= Math.max(0, bytes.length - 0xffff - 22); offset -= 1) {
+    if (view.getUint32(offset, true) === ZIP_END_OF_CENTRAL_DIRECTORY) {
+      eocdOffset = offset;
+      break;
+    }
+  }
+
+  if (eocdOffset < 0) {
+    throw new Error('Unsupported .table file: missing zip footer');
+  }
+
+  const centralDirectoryOffset = view.getUint32(eocdOffset + 16, true);
+  const totalEntries = view.getUint16(eocdOffset + 10, true);
+  const entries = new Map();
+  let cursor = centralDirectoryOffset;
+
+  for (let i = 0; i < totalEntries; i += 1) {
+    if (view.getUint32(cursor, true) !== ZIP_CENTRAL_DIRECTORY_HEADER) {
+      throw new Error('Unsupported .table file: invalid zip directory');
+    }
+
+    const compressionMethod = view.getUint16(cursor + 10, true);
+    const compressedSize = view.getUint32(cursor + 20, true);
+    const fileNameLength = view.getUint16(cursor + 28, true);
+    const extraLength = view.getUint16(cursor + 30, true);
+    const commentLength = view.getUint16(cursor + 32, true);
+    const localHeaderOffset = view.getUint32(cursor + 42, true);
+    const fileNameStart = cursor + 46;
+    const fileNameBytes = bytes.slice(fileNameStart, fileNameStart + fileNameLength);
+    const fileName = decoder.decode(fileNameBytes);
+
+    const localHeaderSignature = view.getUint32(localHeaderOffset, true);
+    if (localHeaderSignature !== ZIP_LOCAL_FILE_HEADER) {
+      throw new Error('Unsupported .table file: invalid local zip header');
+    }
+
+    const localNameLength = view.getUint16(localHeaderOffset + 26, true);
+    const localExtraLength = view.getUint16(localHeaderOffset + 28, true);
+    const fileDataStart = localHeaderOffset + 30 + localNameLength + localExtraLength;
+    const compressedBytes = bytes.slice(fileDataStart, fileDataStart + compressedSize);
+
+    entries.set(fileName, {
+      compressionMethod,
+      compressedBytes,
+    });
+
+    cursor += 46 + fileNameLength + extraLength + commentLength;
+  }
+
+  return entries;
+}
+
+async function readZipEntryText(entries, entryName) {
+  const entry = entries.get(entryName);
+  if (!entry) {
+    return '';
+  }
+
+  let outputBytes = null;
+  if (entry.compressionMethod === ZIP_COMPRESSION_STORED) {
+    outputBytes = entry.compressedBytes;
+  } else if (entry.compressionMethod === ZIP_COMPRESSION_DEFLATE) {
+    outputBytes = await inflateRaw(entry.compressedBytes);
+  } else {
+    throw new Error(`Unsupported .table compression method: ${entry.compressionMethod}`);
+  }
+
+  return new TextDecoder('utf-8').decode(outputBytes);
+}
+
+async function parseWorkbookSharedStrings(entries) {
+  const xmlText = await readZipEntryText(entries, 'xl/sharedStrings.xml');
+  if (!xmlText) {
+    return [];
+  }
+
+  const doc = parseXml(xmlText);
+  return Array.from(doc.querySelectorAll('sst > si')).map((item) => {
+    const textNodes = item.querySelectorAll('t');
+    if (!textNodes.length) {
+      return '';
+    }
+    return Array.from(textNodes).map((node) => getXmlTextContent(node)).join('');
+  });
+}
+
+async function parseWorkbookFirstSheet(entries) {
+  const xmlText = await readZipEntryText(entries, 'xl/worksheets/sheet1.xml');
+  if (!xmlText) {
+    throw new Error('The .table file does not contain sheet1.xml');
+  }
+
+  return parseXml(xmlText);
+}
+
+function buildTableContentFromSheet(sheetDoc, sharedStrings) {
+  const content = [];
+  let maxRowIndex = -1;
+  let maxColumnIndex = -1;
+
+  Array.from(sheetDoc.querySelectorAll('worksheet > sheetData > row')).forEach((rowNode) => {
+    Array.from(rowNode.querySelectorAll(':scope > c')).forEach((cellNode) => {
+      const ref = parseCellReference(cellNode.getAttribute('r'));
+      if (!ref) {
+        return;
+      }
+
+      const { rowIndex, columnIndex } = ref;
+      while (content.length <= rowIndex) {
+        content.push([]);
+      }
+      while (content[rowIndex].length <= columnIndex) {
+        content[rowIndex].push('');
+      }
+
+      content[rowIndex][columnIndex] = getCellText(cellNode, sharedStrings);
+      maxRowIndex = Math.max(maxRowIndex, rowIndex);
+      maxColumnIndex = Math.max(maxColumnIndex, columnIndex);
+    });
+  });
+
+  if (maxRowIndex < 0 || maxColumnIndex < 0) {
+    return [];
+  }
+
+  const normalized = [];
+  for (let rowIndex = 0; rowIndex <= maxRowIndex; rowIndex += 1) {
+    const row = content[rowIndex] || [];
+    const normalizedRow = [];
+    for (let columnIndex = 0; columnIndex <= maxColumnIndex; columnIndex += 1) {
+      normalizedRow.push(String(row[columnIndex] || ''));
+    }
+    normalized.push(normalizedRow);
+  }
+
+  while (normalized.length && normalized[normalized.length - 1].every((cell) => cell === '')) {
+    normalized.pop();
+  }
+
+  return normalized;
+}
+
+async function parseTableAttachmentArrayBuffer(arrayBuffer) {
+  const entries = await readZipEntries(arrayBuffer);
+  const sharedStrings = await parseWorkbookSharedStrings(entries);
+  const sheetDoc = await parseWorkbookFirstSheet(entries);
+  const content = buildTableContentFromSheet(sheetDoc, sharedStrings);
+
+  if (!content.length) {
+    throw new Error('The .table file is empty');
+  }
+
+  const firstRow = content[0] || [];
+  const secondRow = content[1] || [];
+  const firstRowFilledCount = firstRow.filter((cell) => String(cell || '').trim() !== '').length;
+  const secondRowFilledCount = secondRow.filter((cell) => String(cell || '').trim() !== '').length;
+
+  return {
+    withHeadings: firstRowFilledCount > 0 && content.length > 1 && firstRowFilledCount >= secondRowFilledCount,
+    content,
+  };
+}
+
 /**
  * @typedef {object} AttachesToolData
  * @description Attaches Tool's output data format
@@ -286,7 +551,7 @@ export default class AttachesTool {
     });
 
     this.enableFileUpload = this.enableFileUpload.bind(this);
-    this.onParsePdfClick = this.onParsePdfClick.bind(this);
+    this.onParseAttachmentClick = this.onParseAttachmentClick.bind(this);
   }
 
   /**
@@ -340,18 +605,33 @@ export default class AttachesTool {
     };
   }
 
-  /**
-   * Returns true if the current attachment is a PDF.
-   * @returns {boolean}
-   */
-  isPdfAttachment() {
+  getAttachmentExtension() {
     try {
-      const f = this.data && this.data.file ? this.data.file : {};
-      const ext = (f.extension || getExtensionFromFileName(f.name) || '').toString().trim().replace('.', '').toLowerCase();
-      return ext === 'pdf';
+      const file = this.data && this.data.file ? this.data.file : {};
+      return (file.extension || getExtensionFromFileName(file.name) || getExtensionFromFileName(file.url) || '')
+        .toString()
+        .trim()
+        .replace(/^\./, '')
+        .toLowerCase();
     } catch (e) {
-      return false;
+      return '';
     }
+  }
+
+  isPdfAttachment() {
+    return this.getAttachmentExtension() === 'pdf';
+  }
+
+  isTableAttachment() {
+    return this.getAttachmentExtension() === 'table';
+  }
+
+  isParseableAttachment() {
+    if (this.isTableAttachment()) {
+      return true;
+    }
+
+    return this.isPdfAttachment() && typeof this.config.parseEndpoint === 'string' && this.config.parseEndpoint.trim() !== '';
   }
 
   /**
@@ -390,6 +670,7 @@ export default class AttachesTool {
       dmg: '#e26f6f',
       json: '#2988f0',
       csv: '#11AE3D',
+      table: '#11AE3D',
     };
   }
 
@@ -635,13 +916,13 @@ export default class AttachesTool {
 
     // QNotes 扩展：如果是 PDF，显示“解析”按钮（由服务端调用 Docling，返回 blocks 后插入当前笔记）
     try {
-      const canParse = !this.readOnly && this.isPdfAttachment() && typeof this.config.parseEndpoint === 'string' && this.config.parseEndpoint.trim() !== '';
+      const canParse = !this.readOnly && this.isParseableAttachment();
       if (canParse) {
         this.nodes.parseButton = make('button', this.CSS.parseButton, {
           type: 'button',
           textContent: this.config.parseButtonText || '解析',
         });
-        this.nodes.parseButton.addEventListener('click', this.onParsePdfClick);
+        this.nodes.parseButton.addEventListener('click', this.onParseAttachmentClick);
         this.nodes.wrapper.appendChild(this.nodes.parseButton);
       }
     } catch (e) {
@@ -779,6 +1060,155 @@ export default class AttachesTool {
         btn.textContent = prevText || (this.config.parseButtonText || '解析');
       }
       this._isParsingPdf = false;
+    }
+  }
+
+  insertBlocksAfterCurrent(blocks) {
+    const blockIndex = this.api.blocks.getCurrentBlockIndex();
+    if (typeof blockIndex !== 'number' || blockIndex < 0) {
+      throw new Error('Unable to locate current block');
+    }
+
+    let insertIndex = blockIndex + 1;
+    for (const block of blocks) {
+      if (!block || typeof block !== 'object' || typeof block.type !== 'string') {
+        continue;
+      }
+
+      const data = block.data && typeof block.data === 'object' ? block.data : {};
+      this.api.blocks.insert(block.type, data, undefined, insertIndex, false);
+      insertIndex += 1;
+    }
+
+    try {
+      this.api.blocks.getBlockByIndex(blockIndex).dispatchChange();
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  async parsePdfAttachment() {
+    const parseEndpoint = (this.config.parseEndpoint || '').toString().trim();
+    if (!parseEndpoint) {
+      throw new Error(this.config.parseErrorMessage || 'Parse failed');
+    }
+
+    const noteId = (window.QNotesApp && window.QNotesApp.state) ? window.QNotesApp.state.currentNoteId : null;
+    if (!noteId) {
+      throw new Error('Current note not found');
+    }
+
+    const blockIndex = this.api.blocks.getCurrentBlockIndex();
+    if (typeof blockIndex !== 'number' || blockIndex < 0) {
+      throw new Error('Unable to locate current block');
+    }
+
+    const headers = {
+      ...(this.config.parseRequestHeaders || {}),
+      'Content-Type': 'application/json',
+    };
+
+    const resp = await fetch(parseEndpoint, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        note_id: noteId,
+        block_index: blockIndex,
+        mode: 'sync',
+        max_wait_seconds: 120,
+      }),
+    });
+
+    const json = await resp.json().catch(() => null);
+    if (!resp.ok) {
+      const msg = (json && (json.error || json.message))
+        ? (json.error || json.message)
+        : (this.config.parseErrorMessage || 'Parse failed');
+      throw new Error(msg);
+    }
+
+    if (resp.status === 202 && json && json.task_id && !json.blocks) {
+      this.api.notifier.show({
+        message: `解析任务已提交：${json.task_id}`,
+        style: 'success',
+      });
+      return;
+    }
+
+    const blocks = json && Array.isArray(json.blocks) ? json.blocks : [];
+    if (!blocks.length) {
+      throw new Error((json && json.error) ? String(json.error) : '解析结果为空');
+    }
+
+    this.insertBlocksAfterCurrent(blocks);
+    this.api.notifier.show({
+      message: 'PDF 解析完成，已插入到笔记中',
+      style: 'success',
+    });
+  }
+
+  async parseTableAttachment() {
+    const file = this.data && this.data.file ? this.data.file : {};
+    const fileUrl = typeof file.url === 'string' ? file.url.trim() : '';
+    if (!fileUrl) {
+      throw new Error('Attachment url is missing');
+    }
+
+    const response = await fetch(fileUrl, {
+      headers: this.config.parseRequestHeaders || {},
+    });
+
+    if (!response.ok) {
+      throw new Error(`下载 .table 失败 (${response.status})`);
+    }
+
+    const tableData = await parseTableAttachmentArrayBuffer(await response.arrayBuffer());
+    if (!tableData || !Array.isArray(tableData.content) || !tableData.content.length) {
+      throw new Error('未解析出表格内容');
+    }
+
+    this.insertBlocksAfterCurrent([{
+      type: 'table',
+      data: tableData,
+    }]);
+
+    this.api.notifier.show({
+      message: '.table 解析完成，已插入到笔记中',
+      style: 'success',
+    });
+  }
+
+  async onParseAttachmentClick() {
+    if (this._isParsingAttachment) return;
+    this._isParsingAttachment = true;
+
+    const btn = this.nodes.parseButton;
+    const prevText = btn ? btn.textContent : '';
+    try {
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = this.config.parseLoadingText || '解析中...';
+      }
+
+      if (this.isTableAttachment()) {
+        await this.parseTableAttachment();
+      } else if (this.isPdfAttachment()) {
+        await this.parsePdfAttachment();
+      } else {
+        throw new Error('当前附件不支持解析');
+      }
+    } catch (e) {
+      const msg = e && e.message ? e.message : (this.config.parseErrorMessage || 'Parse failed');
+      this.api.notifier.show({
+        message: msg,
+        style: 'error',
+      });
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = prevText || (this.config.parseButtonText || '解析');
+      }
+      this._isParsingAttachment = false;
     }
   }
 

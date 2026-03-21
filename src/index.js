@@ -17,6 +17,10 @@ const UNIVER_LOCALE = 'zhCN';
 const UNIVER_DEFAULT_ROW_COUNT = 1000;
 const UNIVER_DEFAULT_COLUMN_COUNT = 20;
 
+if (typeof window !== 'undefined' && typeof console !== 'undefined' && typeof console.info === 'function') {
+  console.info(`[QNotes][AttachesTool] loaded version ${BUILD_TIME_VERSION}`);
+}
+
 function parseXml(xmlText) {
   if (typeof DOMParser === 'undefined') {
     throw new Error('Current environment does not support XML parsing');
@@ -97,7 +101,7 @@ function getCellText(cell, sharedStrings) {
 
 async function inflateRaw(compressedBytes) {
   if (typeof DecompressionStream === 'undefined') {
-    throw new Error('Current environment does not support .table decompression');
+    throw new Error('Current environment does not support spreadsheet decompression');
   }
 
   const stream = new Blob([compressedBytes]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
@@ -121,7 +125,7 @@ async function readZipEntries(arrayBuffer) {
   }
 
   if (eocdOffset < 0) {
-    throw new Error('Unsupported .table file: missing zip footer');
+    throw new Error('Unsupported spreadsheet file: missing zip footer');
   }
 
   const centralDirectoryOffset = view.getUint32(eocdOffset + 16, true);
@@ -131,7 +135,7 @@ async function readZipEntries(arrayBuffer) {
 
   for (let i = 0; i < totalEntries; i += 1) {
     if (view.getUint32(cursor, true) !== ZIP_CENTRAL_DIRECTORY_HEADER) {
-      throw new Error('Unsupported .table file: invalid zip directory');
+      throw new Error('Unsupported spreadsheet file: invalid zip directory');
     }
 
     const compressionMethod = view.getUint16(cursor + 10, true);
@@ -146,7 +150,7 @@ async function readZipEntries(arrayBuffer) {
 
     const localHeaderSignature = view.getUint32(localHeaderOffset, true);
     if (localHeaderSignature !== ZIP_LOCAL_FILE_HEADER) {
-      throw new Error('Unsupported .table file: invalid local zip header');
+      throw new Error('Unsupported spreadsheet file: invalid local zip header');
     }
 
     const localNameLength = view.getUint16(localHeaderOffset + 26, true);
@@ -177,7 +181,7 @@ async function readZipEntryText(entries, entryName) {
   } else if (entry.compressionMethod === ZIP_COMPRESSION_DEFLATE) {
     outputBytes = await inflateRaw(entry.compressedBytes);
   } else {
-    throw new Error(`Unsupported .table compression method: ${entry.compressionMethod}`);
+    throw new Error(`Unsupported spreadsheet compression method: ${entry.compressionMethod}`);
   }
 
   return new TextDecoder('utf-8').decode(outputBytes);
@@ -202,7 +206,7 @@ async function parseWorkbookSharedStrings(entries) {
 async function parseWorkbookFirstSheet(entries) {
   const xmlText = await readZipEntryText(entries, 'xl/worksheets/sheet1.xml');
   if (!xmlText) {
-    throw new Error('The .table file does not contain sheet1.xml');
+    throw new Error('The spreadsheet file does not contain sheet1.xml');
   }
 
   return parseXml(xmlText);
@@ -262,7 +266,7 @@ async function parseTableAttachmentArrayBuffer(arrayBuffer) {
   const content = buildTableContentFromSheet(sheetDoc, sharedStrings);
 
   if (!content.length) {
-    throw new Error('The .table file is empty');
+    throw new Error('The spreadsheet file is empty');
   }
 
   const firstRow = content[0] || [];
@@ -589,10 +593,12 @@ export default class AttachesTool {
    * @param {AttachesToolConfig} options.config - user defined config
    * @param {EditorAPI} options.api - Editor.js API
    * @param {boolean} options.readOnly - flag indicates whether the Read-Only mode enabled or not
+   * @param {object} [options.block] - current block API
    */
-  constructor({ data, config, api, readOnly }) {
+  constructor({ data, config, api, readOnly, block }) {
     this.api = api;
     this.readOnly = readOnly;
+    this.block = block || null;
 
     this.nodes = {
       wrapper: null,
@@ -714,7 +720,8 @@ export default class AttachesTool {
   }
 
   isTableAttachment() {
-    return this.getAttachmentExtension() === 'table';
+    const extension = this.getAttachmentExtension();
+    return extension === 'table' || extension === 'xlsx';
   }
 
   isParseableAttachment() {
@@ -1155,10 +1162,7 @@ export default class AttachesTool {
   }
 
   insertBlocksAfterCurrent(blocks) {
-    const blockIndex = this.api.blocks.getCurrentBlockIndex();
-    if (typeof blockIndex !== 'number' || blockIndex < 0) {
-      throw new Error('Unable to locate current block');
-    }
+    const blockIndex = this.getOwnBlockIndex();
 
     let insertIndex = blockIndex + 1;
     for (const block of blocks) {
@@ -1178,6 +1182,38 @@ export default class AttachesTool {
     }
   }
 
+  getOwnBlockIndex() {
+    try {
+      const blockId = this.block && typeof this.block.id === 'string' ? this.block.id : '';
+      if (blockId && this.api && this.api.blocks && typeof this.api.blocks.getBlockIndex === 'function') {
+        const byIdIndex = this.api.blocks.getBlockIndex(blockId);
+        if (typeof byIdIndex === 'number' && byIdIndex >= 0) {
+          return byIdIndex;
+        }
+      }
+    } catch (e) {
+      // ignore and fallback
+    }
+
+    try {
+      const currentIndex = this.api.blocks.getCurrentBlockIndex();
+      if (typeof currentIndex === 'number' && currentIndex >= 0) {
+        return currentIndex;
+      }
+    } catch (e) {
+      // ignore and fallback
+    }
+
+    if (this.api && this.api.blocks && typeof this.api.blocks.getBlocksCount === 'function') {
+      const count = this.api.blocks.getBlocksCount();
+      if (typeof count === 'number' && count > 0) {
+        return count - 1;
+      }
+    }
+
+    throw new Error('Unable to locate current block');
+  }
+
   async parsePdfAttachment() {
     const parseEndpoint = (this.config.parseEndpoint || '').toString().trim();
     if (!parseEndpoint) {
@@ -1189,10 +1225,7 @@ export default class AttachesTool {
       throw new Error('Current note not found');
     }
 
-    const blockIndex = this.api.blocks.getCurrentBlockIndex();
-    if (typeof blockIndex !== 'number' || blockIndex < 0) {
-      throw new Error('Unable to locate current block');
-    }
+    const blockIndex = this.getOwnBlockIndex();
 
     const headers = {
       ...(this.config.parseRequestHeaders || {}),
@@ -1250,7 +1283,7 @@ export default class AttachesTool {
     });
 
     if (!response.ok) {
-      throw new Error(`下载 .table 失败 (${response.status})`);
+      throw new Error(`下载表格文件失败 (${response.status})`);
     }
 
     const tableData = await parseTableAttachmentArrayBuffer(await response.arrayBuffer());
@@ -1329,7 +1362,7 @@ export default class AttachesTool {
       }]);
 
       this.api.notifier.show({
-        message: '.table 已转换为 Univer 表格并插入到笔记中',
+        message: '表格已转换为 Univer 表格并插入到笔记中',
         style: 'success',
       });
       return;
@@ -1341,7 +1374,7 @@ export default class AttachesTool {
     }]);
 
     this.api.notifier.show({
-      message: '.table 已转换为 Editor.js 表格并插入到笔记中',
+      message: '表格已转换为 Editor.js 表格并插入到笔记中',
       style: 'success',
     });
   }
@@ -1353,19 +1386,25 @@ export default class AttachesTool {
     const btn = this.nodes.parseButton;
     const prevText = btn ? btn.textContent : '';
     try {
-      if (btn) {
-        btn.disabled = true;
-        btn.textContent = this.config.parseLoadingText || '解析中...';
-      }
-
       if (this.isTableAttachment()) {
         const targetType = await this.chooseTableInsertType();
         if (!targetType) {
           return;
         }
+
+        if (btn) {
+          btn.disabled = true;
+          btn.textContent = this.config.parseLoadingText || '解析中...';
+        }
+
         const tableData = await this.parseTableAttachment();
         this.insertParsedTable(tableData, targetType);
       } else if (this.isPdfAttachment()) {
+        if (btn) {
+          btn.disabled = true;
+          btn.textContent = this.config.parseLoadingText || '解析中...';
+        }
+
         await this.parsePdfAttachment();
       } else {
         throw new Error('当前附件不支持解析');

@@ -39,6 +39,168 @@ function getXmlTextContent(node) {
   return node ? String(node.textContent || '') : '';
 }
 
+function getFirstChildByLocalName(parent, localName) {
+  if (!parent || !localName) {
+    return null;
+  }
+
+  const target = String(localName).toLowerCase();
+  return Array.from(parent.children || []).find((child) => String(child.localName || child.nodeName || '').toLowerCase() === target) || null;
+}
+
+function getFirstDescendantByLocalName(parent, localName) {
+  if (!parent || !localName) {
+    return null;
+  }
+
+  const target = String(localName).toLowerCase();
+  return Array.from(parent.getElementsByTagName('*')).find((child) => String(child.localName || child.nodeName || '').toLowerCase() === target) || null;
+}
+
+function getDescendantsByLocalName(parent, localName) {
+  if (!parent || !localName) {
+    return [];
+  }
+
+  const target = String(localName).toLowerCase();
+  return Array.from(parent.getElementsByTagName('*')).filter((child) => String(child.localName || child.nodeName || '').toLowerCase() === target);
+}
+
+function getAttributeValue(node, names) {
+  if (!node || !Array.isArray(names)) {
+    return '';
+  }
+
+  for (const name of names) {
+    const value = node.getAttribute(name);
+    if (value != null && String(value).trim() !== '') {
+      return String(value).trim();
+    }
+  }
+
+  if (node.attributes) {
+    for (const attr of Array.from(node.attributes)) {
+      if (names.includes(attr.name) || names.includes(attr.localName)) {
+        const value = String(attr.value || '').trim();
+        if (value) {
+          return value;
+        }
+      }
+    }
+  }
+
+  return '';
+}
+
+function dirname(entryName) {
+  const normalized = String(entryName || '').replace(/\\/g, '/');
+  const index = normalized.lastIndexOf('/');
+  return index >= 0 ? normalized.slice(0, index) : '';
+}
+
+function basename(entryName) {
+  const normalized = String(entryName || '').replace(/\\/g, '/');
+  const index = normalized.lastIndexOf('/');
+  return index >= 0 ? normalized.slice(index + 1) : normalized;
+}
+
+function normalizeZipPath(baseEntryName, target) {
+  const normalizedTarget = String(target || '').replace(/\\/g, '/').trim();
+  if (!normalizedTarget) {
+    return '';
+  }
+
+  const baseDir = dirname(baseEntryName);
+  const seed = normalizedTarget.startsWith('/')
+    ? []
+    : (baseDir ? baseDir.split('/').filter(Boolean) : []);
+  const parts = normalizedTarget.split('/').filter(Boolean);
+
+  for (const part of parts) {
+    if (part === '.') {
+      continue;
+    }
+    if (part === '..') {
+      seed.pop();
+      continue;
+    }
+    seed.push(part);
+  }
+
+  return seed.join('/');
+}
+
+function emuToPixels(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return 0;
+  }
+
+  return Math.max(1, Math.round(numeric / 9525));
+}
+
+function escapeHtmlContent(value) {
+  return String(value == null ? '' : value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function getUploadedUrl(result) {
+  if (!result || typeof result !== 'object') {
+    return '';
+  }
+
+  if (result.file && typeof result.file.url === 'string' && result.file.url) {
+    return result.file.url;
+  }
+
+  if (typeof result.url === 'string' && result.url) {
+    return result.url;
+  }
+
+  return '';
+}
+
+function extensionFromPath(entryName) {
+  const normalized = String(entryName || '').trim().toLowerCase();
+  const index = normalized.lastIndexOf('.');
+  return index >= 0 ? normalized.slice(index + 1) : '';
+}
+
+function getMimeTypeFromPath(entryName) {
+  switch (extensionFromPath(entryName)) {
+    case 'png':
+      return 'image/png';
+    case 'jpg':
+    case 'jpeg':
+      return 'image/jpeg';
+    case 'gif':
+      return 'image/gif';
+    case 'bmp':
+      return 'image/bmp';
+    case 'webp':
+      return 'image/webp';
+    case 'svg':
+      return 'image/svg+xml';
+    default:
+      return 'application/octet-stream';
+  }
+}
+
+function createUploadableFile(bytes, entryName) {
+  const mimeType = getMimeTypeFromPath(entryName);
+  const blob = new Blob([bytes], { type: mimeType });
+  const name = basename(entryName) || `spreadsheet-image.${extensionFromPath(entryName) || 'bin'}`;
+
+  if (typeof File === 'function') {
+    return new File([blob], name, { type: mimeType });
+  }
+
+  blob.name = name;
+  return blob;
+}
+
 function columnLettersToIndex(letters) {
   const normalized = String(letters || '').trim().toUpperCase();
   let value = 0;
@@ -187,6 +349,23 @@ async function readZipEntryText(entries, entryName) {
   return new TextDecoder('utf-8').decode(outputBytes);
 }
 
+async function readZipEntryBytes(entries, entryName) {
+  const entry = entries.get(entryName);
+  if (!entry) {
+    return null;
+  }
+
+  if (entry.compressionMethod === ZIP_COMPRESSION_STORED) {
+    return entry.compressedBytes;
+  }
+
+  if (entry.compressionMethod === ZIP_COMPRESSION_DEFLATE) {
+    return await inflateRaw(entry.compressedBytes);
+  }
+
+  throw new Error(`Unsupported spreadsheet compression method: ${entry.compressionMethod}`);
+}
+
 async function parseWorkbookSharedStrings(entries) {
   const xmlText = await readZipEntryText(entries, 'xl/sharedStrings.xml');
   if (!xmlText) {
@@ -259,11 +438,177 @@ function buildTableContentFromSheet(sheetDoc, sharedStrings) {
   return normalized;
 }
 
+function buildCellMatrixFromSheet(sheetDoc, sharedStrings) {
+  const matrix = [];
+  let maxRowIndex = -1;
+  let maxColumnIndex = -1;
+
+  Array.from(sheetDoc.querySelectorAll('worksheet > sheetData > row')).forEach((rowNode) => {
+    Array.from(rowNode.querySelectorAll(':scope > c')).forEach((cellNode) => {
+      const ref = parseCellReference(cellNode.getAttribute('r'));
+      if (!ref) {
+        return;
+      }
+
+      const { rowIndex, columnIndex } = ref;
+      while (matrix.length <= rowIndex) {
+        matrix.push([]);
+      }
+      while (matrix[rowIndex].length <= columnIndex) {
+        matrix[rowIndex].push({ text: '', images: [] });
+      }
+
+      matrix[rowIndex][columnIndex].text = getCellText(cellNode, sharedStrings);
+      maxRowIndex = Math.max(maxRowIndex, rowIndex);
+      maxColumnIndex = Math.max(maxColumnIndex, columnIndex);
+    });
+  });
+
+  if (maxRowIndex < 0 || maxColumnIndex < 0) {
+    return [];
+  }
+
+  const normalized = [];
+  for (let rowIndex = 0; rowIndex <= maxRowIndex; rowIndex += 1) {
+    const row = matrix[rowIndex] || [];
+    const normalizedRow = [];
+    for (let columnIndex = 0; columnIndex <= maxColumnIndex; columnIndex += 1) {
+      const cell = row[columnIndex] || { text: '', images: [] };
+      normalizedRow.push({
+        text: String(cell.text || ''),
+        images: Array.isArray(cell.images) ? cell.images.slice() : [],
+      });
+    }
+    normalized.push(normalizedRow);
+  }
+
+  while (normalized.length && normalized[normalized.length - 1].every((cell) => cell.text === '' && (!cell.images || cell.images.length === 0))) {
+    normalized.pop();
+  }
+
+  return normalized;
+}
+
+async function parseWorkbookSheetImages(entries, sheetEntryName = 'xl/worksheets/sheet1.xml') {
+  const sheetRelsEntryName = `${dirname(sheetEntryName)}/_rels/${basename(sheetEntryName)}.rels`;
+  const sheetRelsText = await readZipEntryText(entries, sheetRelsEntryName);
+  if (!sheetRelsText) {
+    return [];
+  }
+
+  const sheetRelsDoc = parseXml(sheetRelsText);
+  const drawingRelationships = getDescendantsByLocalName(sheetRelsDoc, 'Relationship')
+    .filter((node) => String(getAttributeValue(node, ['Type'])).includes('/drawing'))
+    .map((node) => ({
+      id: getAttributeValue(node, ['Id']),
+      target: normalizeZipPath(sheetEntryName, getAttributeValue(node, ['Target'])),
+    }))
+    .filter((item) => item.id && item.target);
+
+  if (!drawingRelationships.length) {
+    return [];
+  }
+
+  const bytesCache = new Map();
+  const images = [];
+
+  for (const drawingRel of drawingRelationships) {
+    const drawingEntryName = drawingRel.target;
+    const drawingText = await readZipEntryText(entries, drawingEntryName);
+    if (!drawingText) {
+      continue;
+    }
+
+    const drawingDoc = parseXml(drawingText);
+    const drawingRelsEntryName = `${dirname(drawingEntryName)}/_rels/${basename(drawingEntryName)}.rels`;
+    const drawingRelsText = await readZipEntryText(entries, drawingRelsEntryName);
+    const drawingRelsMap = new Map();
+
+    if (drawingRelsText) {
+      const drawingRelsDoc = parseXml(drawingRelsText);
+      getDescendantsByLocalName(drawingRelsDoc, 'Relationship').forEach((node) => {
+        const id = getAttributeValue(node, ['Id']);
+        const target = normalizeZipPath(drawingEntryName, getAttributeValue(node, ['Target']));
+        if (id && target) {
+          drawingRelsMap.set(id, target);
+        }
+      });
+    }
+
+    const anchors = [
+      ...getDescendantsByLocalName(drawingDoc, 'twoCellAnchor'),
+      ...getDescendantsByLocalName(drawingDoc, 'oneCellAnchor'),
+    ];
+
+    for (const anchor of anchors) {
+      const fromNode = getFirstChildByLocalName(anchor, 'from');
+      const rowIndex = parseInt(getXmlTextContent(getFirstChildByLocalName(fromNode, 'row')), 10);
+      const columnIndex = parseInt(getXmlTextContent(getFirstChildByLocalName(fromNode, 'col')), 10);
+
+      if (!Number.isFinite(rowIndex) || rowIndex < 0 || !Number.isFinite(columnIndex) || columnIndex < 0) {
+        continue;
+      }
+
+      const blipNode = getFirstDescendantByLocalName(anchor, 'blip');
+      const embedId = getAttributeValue(blipNode, ['r:embed', 'embed']);
+      const imageEntryName = drawingRelsMap.get(embedId);
+
+      if (!imageEntryName) {
+        continue;
+      }
+
+      let imageBytes = bytesCache.get(imageEntryName);
+      if (!imageBytes) {
+        imageBytes = readZipEntryBytes(entries, imageEntryName);
+        bytesCache.set(imageEntryName, imageBytes);
+      }
+
+      const resolvedBytes = await imageBytes;
+      if (!resolvedBytes) {
+        continue;
+      }
+
+      const extNode = getFirstDescendantByLocalName(anchor, 'ext');
+      images.push({
+        rowIndex,
+        columnIndex,
+        entryName: imageEntryName,
+        bytes: resolvedBytes,
+        width: emuToPixels(getAttributeValue(extNode, ['cx'])),
+        height: emuToPixels(getAttributeValue(extNode, ['cy'])),
+      });
+    }
+  }
+
+  return images;
+}
+
 async function parseTableAttachmentArrayBuffer(arrayBuffer) {
   const entries = await readZipEntries(arrayBuffer);
   const sharedStrings = await parseWorkbookSharedStrings(entries);
   const sheetDoc = await parseWorkbookFirstSheet(entries);
-  const content = buildTableContentFromSheet(sheetDoc, sharedStrings);
+  const cells = buildCellMatrixFromSheet(sheetDoc, sharedStrings);
+  const images = await parseWorkbookSheetImages(entries);
+
+  images.forEach((image) => {
+    const row = cells[image.rowIndex];
+    if (!row) {
+      return;
+    }
+
+    const cell = row[image.columnIndex];
+    if (!cell) {
+      return;
+    }
+
+    if (!Array.isArray(cell.images)) {
+      cell.images = [];
+    }
+
+    cell.images.push(image);
+  });
+
+  const content = cells.map((row) => row.map((cell) => String(cell && cell.text ? cell.text : '')));
 
   if (!content.length) {
     throw new Error('The spreadsheet file is empty');
@@ -277,6 +622,7 @@ async function parseTableAttachmentArrayBuffer(arrayBuffer) {
   return {
     withHeadings: firstRowFilledCount > 0 && content.length > 1 && firstRowFilledCount >= secondRowFilledCount,
     content,
+    cells,
   };
 }
 
@@ -291,6 +637,158 @@ function createRandomId(length = 12) {
   return value;
 }
 
+function buildEditorJsTableCellValue(cell) {
+  const text = String(cell && cell.text ? cell.text : '');
+  const images = Array.isArray(cell && cell.images) ? cell.images : [];
+
+  if (!images.length) {
+    return text;
+  }
+
+  const safeText = escapeHtmlContent(text).replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n/g, '<br>');
+  const imageHtml = images.map((image) => {
+    const width = Number(image && image.width);
+    const height = Number(image && image.height);
+    const sizeAttrs = [
+      Number.isFinite(width) && width > 0 ? ` width="${width}"` : '',
+      Number.isFinite(height) && height > 0 ? ` height="${height}"` : '',
+    ].join('');
+
+    return `<img src="${escapeHtmlContent(image.url || '')}"${sizeAttrs}>`;
+  }).join('');
+
+  return safeText ? `${safeText}<br>${imageHtml}` : imageHtml;
+}
+
+function buildEditorJsTableDataFromCells(parsedTable) {
+  const cells = Array.isArray(parsedTable && parsedTable.cells) ? parsedTable.cells : [];
+
+  return {
+    withHeadings: !!(parsedTable && parsedTable.withHeadings),
+    content: cells.map((row) => (row || []).map((cell) => buildEditorJsTableCellValue(cell))),
+  };
+}
+
+function buildUniverRichCell(text, images) {
+  const normalizedText = String(text == null ? '' : text);
+  const normalizedImages = Array.isArray(images) ? images.filter((image) => image && image.url) : [];
+
+  if (!normalizedImages.length) {
+    return {
+      v: normalizedText,
+      t: 1,
+    };
+  }
+
+  let dataStream = '';
+  let cursor = 0;
+  let topOffset = 0;
+  const drawings = {};
+  const drawingsOrder = [];
+  const customBlocks = [];
+
+  normalizedImages.forEach((image) => {
+    const drawingId = createRandomId(21);
+    const width = Math.max(24, Number(image.width) || 86);
+    const height = Math.max(24, Number(image.height) || 66);
+
+    drawingsOrder.push(drawingId);
+    customBlocks.push({
+      startIndex: cursor,
+      blockId: drawingId,
+    });
+    drawings[drawingId] = {
+      unitId: 'd',
+      subUnitId: 'd',
+      drawingId,
+      drawingType: 0,
+      imageSourceType: 'URL',
+      source: image.url,
+      transform: {
+        left: 0,
+        top: topOffset,
+        width,
+        height,
+      },
+      docTransform: {
+        size: {
+          width,
+          height,
+        },
+        positionH: {
+          relativeFrom: 0,
+          posOffset: 0,
+        },
+        positionV: {
+          relativeFrom: 1,
+          posOffset: topOffset,
+        },
+        angle: 0,
+      },
+      behindDoc: 0,
+      title: '',
+      description: '',
+      layoutType: 0,
+      wrapText: 0,
+      distB: 0,
+      distL: 0,
+      distR: 0,
+      distT: 0,
+    };
+    dataStream += '\b';
+    cursor += 1;
+    topOffset += height;
+  });
+
+  dataStream += normalizedText;
+  cursor += normalizedText.length;
+  dataStream += '\r\n';
+
+  return {
+    v: normalizedText,
+    t: 1,
+    p: {
+      id: 'd',
+      documentStyle: {
+        pageSize: {
+          width: null,
+          height: null,
+        },
+        marginTop: 0,
+        marginBottom: 2,
+        marginRight: 2,
+        marginLeft: 2,
+        renderConfig: {
+          horizontalAlign: 0,
+          verticalAlign: 0,
+          centerAngle: 0,
+          vertexAngle: 0,
+          wrapStrategy: 0,
+          zeroWidthParagraphBreak: 1,
+        },
+      },
+      body: {
+        dataStream,
+        textRuns: [],
+        paragraphs: [{
+          startIndex: Math.max(0, cursor),
+          paragraphStyle: {
+            horizontalAlign: 0,
+          },
+        }],
+        sectionBreaks: [{
+          startIndex: Math.max(0, cursor + 1),
+        }],
+        customBlocks,
+        customRanges: [],
+        customDecorations: [],
+      },
+      drawings,
+      drawingsOrder,
+    },
+  };
+}
+
 function buildUniverSheetSnapshot(title, matrix) {
   const workbookId = createRandomId(6);
   const sheetId = createRandomId(21);
@@ -300,19 +798,33 @@ function buildUniverSheetSnapshot(title, matrix) {
     Array.isArray(matrix) ? matrix.reduce((max, row) => Math.max(max, Array.isArray(row) ? row.length : 0), 0) : 0
   );
   const cellData = {};
+  const rowData = {};
 
   (matrix || []).forEach((row, rowIndex) => {
     const rowCells = {};
+    let rowHeight = 0;
 
     (row || []).forEach((cell, columnIndex) => {
-      rowCells[String(columnIndex)] = {
-        v: String(cell == null ? '' : cell),
-        t: 1,
-      };
+      const normalizedCell = cell && typeof cell === 'object' && !Array.isArray(cell)
+        ? cell
+        : { text: String(cell == null ? '' : cell), images: [] };
+      const images = Array.isArray(normalizedCell.images) ? normalizedCell.images : [];
+
+      rowCells[String(columnIndex)] = buildUniverRichCell(normalizedCell.text, images);
+
+      images.forEach((image) => {
+        rowHeight = Math.max(rowHeight, Math.max(24, (Number(image.height) || 66) + 8));
+      });
     });
 
     if (Object.keys(rowCells).length > 0) {
       cellData[String(rowIndex)] = rowCells;
+    }
+
+    if (rowHeight > 0) {
+      rowData[String(rowIndex)] = {
+        h: rowHeight,
+      };
     }
   });
 
@@ -344,7 +856,7 @@ function buildUniverSheetSnapshot(title, matrix) {
         defaultRowHeight: 24,
         mergeData: [],
         cellData,
-        rowData: {},
+        rowData,
         columnData: {},
         showGridlines: 1,
         rowHeader: {
@@ -1294,6 +1806,58 @@ export default class AttachesTool {
     return tableData;
   }
 
+  async resolveParsedTableAssets(tableData) {
+    const parsedTable = tableData && typeof tableData === 'object' ? tableData : {};
+    const cells = Array.isArray(parsedTable.cells)
+      ? parsedTable.cells.map((row) => (row || []).map((cell) => ({
+        text: String(cell && cell.text ? cell.text : ''),
+        images: Array.isArray(cell && cell.images) ? cell.images.map((image) => ({ ...image })) : [],
+      })))
+      : [];
+    const uploader = this.config && this.config.uploader ? this.config.uploader : {};
+    const uploadByFile = uploader && typeof uploader.uploadByFile === 'function' ? uploader.uploadByFile : null;
+    const uploadCache = new Map();
+
+    for (const row of cells) {
+      for (const cell of row) {
+        if (!cell || !Array.isArray(cell.images) || cell.images.length === 0) {
+          continue;
+        }
+
+        for (const image of cell.images) {
+          if (!image || image.url) {
+            continue;
+          }
+
+          const cacheKey = String(image.entryName || '');
+
+          if (!uploadByFile) {
+            throw new Error('当前环境未配置表格图片上传能力，暂时无法解析带图片的表格附件');
+          }
+
+          if (!uploadCache.has(cacheKey)) {
+            const file = createUploadableFile(image.bytes, image.entryName);
+            uploadCache.set(cacheKey, Promise.resolve(uploadByFile(file)).then((result) => {
+              const url = getUploadedUrl(result);
+              if (!url) {
+                throw new Error(`表格图片上传失败：${basename(image.entryName) || 'image'}`);
+              }
+              return url;
+            }));
+          }
+
+          image.url = await uploadCache.get(cacheKey);
+        }
+      }
+    }
+
+    return {
+      ...parsedTable,
+      cells,
+      content: cells.map((row) => (row || []).map((cell) => String(cell && cell.text ? cell.text : ''))),
+    };
+  }
+
   async chooseTableInsertType() {
     return new Promise((resolve) => {
       const backdrop = make('div', this.CSS.parseDialogBackdrop);
@@ -1350,14 +1914,16 @@ export default class AttachesTool {
     });
   }
 
-  insertParsedTable(tableData, targetType) {
+  async insertParsedTable(tableData, targetType) {
+    const resolvedTable = await this.resolveParsedTableAssets(tableData);
+
     if (targetType === 'univerSheet') {
       const title = (this.data && this.data.title ? String(this.data.title) : '').trim() || 'Sheet1';
       this.insertBlocksAfterCurrent([{
         type: 'univerSheet',
         data: {
           title,
-          univerData: buildUniverSheetSnapshot(title, tableData.content),
+          univerData: buildUniverSheetSnapshot(title, resolvedTable.cells),
         },
       }]);
 
@@ -1370,7 +1936,7 @@ export default class AttachesTool {
 
     this.insertBlocksAfterCurrent([{
       type: 'table',
-      data: tableData,
+      data: buildEditorJsTableDataFromCells(resolvedTable),
     }]);
 
     this.api.notifier.show({
@@ -1398,7 +1964,7 @@ export default class AttachesTool {
         }
 
         const tableData = await this.parseTableAttachment();
-        this.insertParsedTable(tableData, targetType);
+        await this.insertParsedTable(tableData, targetType);
       } else if (this.isPdfAttachment()) {
         if (btn) {
           btn.disabled = true;

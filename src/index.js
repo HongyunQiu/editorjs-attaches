@@ -12,6 +12,10 @@ const ZIP_CENTRAL_DIRECTORY_HEADER = 0x02014b50;
 const ZIP_END_OF_CENTRAL_DIRECTORY = 0x06054b50;
 const ZIP_COMPRESSION_STORED = 0;
 const ZIP_COMPRESSION_DEFLATE = 8;
+const UNIVER_APP_VERSION = '0.6.10';
+const UNIVER_LOCALE = 'zhCN';
+const UNIVER_DEFAULT_ROW_COUNT = 1000;
+const UNIVER_DEFAULT_COLUMN_COUNT = 20;
 
 function parseXml(xmlText) {
   if (typeof DOMParser === 'undefined') {
@@ -269,6 +273,88 @@ async function parseTableAttachmentArrayBuffer(arrayBuffer) {
   return {
     withHeadings: firstRowFilledCount > 0 && content.length > 1 && firstRowFilledCount >= secondRowFilledCount,
     content,
+  };
+}
+
+function createRandomId(length = 12) {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+  let value = '';
+
+  for (let index = 0; index < length; index += 1) {
+    value += alphabet.charAt(Math.floor(Math.random() * alphabet.length));
+  }
+
+  return value;
+}
+
+function buildUniverSheetSnapshot(title, matrix) {
+  const workbookId = createRandomId(6);
+  const sheetId = createRandomId(21);
+  const rowCount = Math.max(UNIVER_DEFAULT_ROW_COUNT, Array.isArray(matrix) ? matrix.length : 0);
+  const columnCount = Math.max(
+    UNIVER_DEFAULT_COLUMN_COUNT,
+    Array.isArray(matrix) ? matrix.reduce((max, row) => Math.max(max, Array.isArray(row) ? row.length : 0), 0) : 0
+  );
+  const cellData = {};
+
+  (matrix || []).forEach((row, rowIndex) => {
+    const rowCells = {};
+
+    (row || []).forEach((cell, columnIndex) => {
+      rowCells[String(columnIndex)] = {
+        v: String(cell == null ? '' : cell),
+        t: 1,
+      };
+    });
+
+    if (Object.keys(rowCells).length > 0) {
+      cellData[String(rowIndex)] = rowCells;
+    }
+  });
+
+  return {
+    id: workbookId,
+    sheetOrder: [sheetId],
+    name: String(title || 'Sheet1'),
+    appVersion: UNIVER_APP_VERSION,
+    locale: UNIVER_LOCALE,
+    styles: {},
+    sheets: {
+      [sheetId]: {
+        id: sheetId,
+        name: String(title || 'Sheet1'),
+        tabColor: '',
+        hidden: 0,
+        rowCount,
+        columnCount,
+        zoomRatio: 1,
+        freeze: {
+          xSplit: 0,
+          ySplit: 0,
+          startRow: -1,
+          startColumn: -1,
+        },
+        scrollTop: 0,
+        scrollLeft: 0,
+        defaultColumnWidth: 88,
+        defaultRowHeight: 24,
+        mergeData: [],
+        cellData,
+        rowData: {},
+        columnData: {},
+        showGridlines: 1,
+        rowHeader: {
+          width: 46,
+          hidden: 0,
+        },
+        columnHeader: {
+          height: 20,
+          hidden: 0,
+        },
+        rightToLeft: 0,
+      },
+    },
+    resources: [],
   };
 }
 
@@ -598,6 +684,11 @@ export default class AttachesTool {
       size: 'cdx-attaches__size',
       downloadButton: 'cdx-attaches__download-button',
       parseButton: 'cdx-attaches__parse-button',
+      parseDialogBackdrop: 'cdx-attaches__parse-dialog-backdrop',
+      parseDialog: 'cdx-attaches__parse-dialog',
+      parseDialogTitle: 'cdx-attaches__parse-dialog-title',
+      parseDialogButtons: 'cdx-attaches__parse-dialog-buttons',
+      parseDialogCancel: 'cdx-attaches__parse-dialog-cancel',
       fileInfo: 'cdx-attaches__file-info',
       fileIcon: 'cdx-attaches__file-icon',
       fileIconBackground: 'cdx-attaches__file-icon-background',
@@ -1167,13 +1258,90 @@ export default class AttachesTool {
       throw new Error('未解析出表格内容');
     }
 
+    return tableData;
+  }
+
+  async chooseTableInsertType() {
+    return new Promise((resolve) => {
+      const backdrop = make('div', this.CSS.parseDialogBackdrop);
+      const dialog = make('div', this.CSS.parseDialog);
+      const title = make('div', this.CSS.parseDialogTitle, {
+        textContent: '选择要插入的表格类型',
+      });
+      const buttons = make('div', this.CSS.parseDialogButtons);
+      const editorjsButton = make('button', this.CSS.parseButton, {
+        type: 'button',
+        textContent: 'Editor.js 表格',
+      });
+      const univerButton = make('button', this.CSS.parseButton, {
+        type: 'button',
+        textContent: 'Univer 表格',
+      });
+      const cancelButton = make('button', [this.CSS.parseButton, this.CSS.parseDialogCancel], {
+        type: 'button',
+        textContent: '取消',
+      });
+
+      const cleanup = (value) => {
+        if (backdrop.parentNode) {
+          backdrop.parentNode.removeChild(backdrop);
+        }
+        document.removeEventListener('keydown', onKeyDown, true);
+        resolve(value);
+      };
+
+      const onKeyDown = (event) => {
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          cleanup(null);
+        }
+      };
+
+      editorjsButton.addEventListener('click', () => cleanup('table'));
+      univerButton.addEventListener('click', () => cleanup('univerSheet'));
+      cancelButton.addEventListener('click', () => cleanup(null));
+      backdrop.addEventListener('click', (event) => {
+        if (event.target === backdrop) {
+          cleanup(null);
+        }
+      });
+
+      buttons.appendChild(editorjsButton);
+      buttons.appendChild(univerButton);
+      buttons.appendChild(cancelButton);
+      dialog.appendChild(title);
+      dialog.appendChild(buttons);
+      backdrop.appendChild(dialog);
+      document.body.appendChild(backdrop);
+      document.addEventListener('keydown', onKeyDown, true);
+    });
+  }
+
+  insertParsedTable(tableData, targetType) {
+    if (targetType === 'univerSheet') {
+      const title = (this.data && this.data.title ? String(this.data.title) : '').trim() || 'Sheet1';
+      this.insertBlocksAfterCurrent([{
+        type: 'univerSheet',
+        data: {
+          title,
+          univerData: buildUniverSheetSnapshot(title, tableData.content),
+        },
+      }]);
+
+      this.api.notifier.show({
+        message: '.table 已转换为 Univer 表格并插入到笔记中',
+        style: 'success',
+      });
+      return;
+    }
+
     this.insertBlocksAfterCurrent([{
       type: 'table',
       data: tableData,
     }]);
 
     this.api.notifier.show({
-      message: '.table 解析完成，已插入到笔记中',
+      message: '.table 已转换为 Editor.js 表格并插入到笔记中',
       style: 'success',
     });
   }
@@ -1191,7 +1359,12 @@ export default class AttachesTool {
       }
 
       if (this.isTableAttachment()) {
-        await this.parseTableAttachment();
+        const targetType = await this.chooseTableInsertType();
+        if (!targetType) {
+          return;
+        }
+        const tableData = await this.parseTableAttachment();
+        this.insertParsedTable(tableData, targetType);
       } else if (this.isPdfAttachment()) {
         await this.parsePdfAttachment();
       } else {

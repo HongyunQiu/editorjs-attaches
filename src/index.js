@@ -626,6 +626,116 @@ async function parseTableAttachmentArrayBuffer(arrayBuffer) {
   };
 }
 
+function detectCsvDelimiter(text) {
+  const sampleLines = String(text || '')
+    .split(/\r\n|\n|\r/)
+    .map((line) => line.trim())
+    .filter((line) => line !== '')
+    .slice(0, 10);
+  const candidates = [',', ';', '\t'];
+  let bestDelimiter = ',';
+  let bestScore = -1;
+
+  candidates.forEach((delimiter) => {
+    let score = 0;
+
+    sampleLines.forEach((line) => {
+      const count = (line.match(new RegExp(delimiter === '\t' ? '\\t' : `\\${delimiter}`, 'g')) || []).length;
+      score += count;
+    });
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestDelimiter = delimiter;
+    }
+  });
+
+  return bestDelimiter;
+}
+
+function parseCsvText(csvText) {
+  const text = String(csvText || '').replace(/^\uFEFF/, '');
+  const delimiter = detectCsvDelimiter(text);
+  const rows = [];
+  let row = [];
+  let value = '';
+  let inQuotes = false;
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    const next = text[index + 1];
+
+    if (inQuotes) {
+      if (char === '"') {
+        if (next === '"') {
+          value += '"';
+          index += 1;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        value += char;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      inQuotes = true;
+      continue;
+    }
+
+    if (char === delimiter) {
+      row.push(value);
+      value = '';
+      continue;
+    }
+
+    if (char === '\r' || char === '\n') {
+      row.push(value);
+      value = '';
+      rows.push(row);
+      row = [];
+
+      if (char === '\r' && next === '\n') {
+        index += 1;
+      }
+      continue;
+    }
+
+    value += char;
+  }
+
+  if (value !== '' || row.length > 0) {
+    row.push(value);
+    rows.push(row);
+  }
+
+  while (rows.length && rows[rows.length - 1].every((cell) => String(cell || '').trim() === '')) {
+    rows.pop();
+  }
+
+  const maxColumnCount = rows.reduce((max, currentRow) => Math.max(max, Array.isArray(currentRow) ? currentRow.length : 0), 0);
+  const normalizedRows = rows.map((currentRow) => {
+    const nextRow = new Array(maxColumnCount).fill('');
+    (currentRow || []).forEach((cell, columnIndex) => {
+      nextRow[columnIndex] = String(cell == null ? '' : cell);
+    });
+    return nextRow;
+  });
+
+  const firstRow = normalizedRows[0] || [];
+  const secondRow = normalizedRows[1] || [];
+  const firstRowFilledCount = firstRow.filter((cell) => String(cell || '').trim() !== '').length;
+  const secondRowFilledCount = secondRow.filter((cell) => String(cell || '').trim() !== '').length;
+  const cells = normalizedRows.map((currentRow) => currentRow.map((cell) => ({ text: cell, images: [] })));
+
+  return {
+    withHeadings: firstRowFilledCount > 0 && normalizedRows.length > 1 && firstRowFilledCount >= secondRowFilledCount,
+    content: normalizedRows,
+    cells,
+  };
+}
+
 function createRandomId(length = 12) {
   const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
   let value = '';
@@ -1233,7 +1343,7 @@ export default class AttachesTool {
 
   isTableAttachment() {
     const extension = this.getAttachmentExtension();
-    return extension === 'table' || extension === 'xlsx';
+    return extension === 'table' || extension === 'xlsx' || extension === 'csv';
   }
 
   isParseableAttachment() {
@@ -1786,6 +1896,7 @@ export default class AttachesTool {
   async parseTableAttachment() {
     const file = this.data && this.data.file ? this.data.file : {};
     const fileUrl = typeof file.url === 'string' ? file.url.trim() : '';
+    const extension = this.getAttachmentExtension();
     if (!fileUrl) {
       throw new Error('Attachment url is missing');
     }
@@ -1798,7 +1909,14 @@ export default class AttachesTool {
       throw new Error(`下载表格文件失败 (${response.status})`);
     }
 
-    const tableData = await parseTableAttachmentArrayBuffer(await response.arrayBuffer());
+    let tableData = null;
+
+    if (extension === 'csv') {
+      tableData = parseCsvText(await response.text());
+    } else {
+      tableData = await parseTableAttachmentArrayBuffer(await response.arrayBuffer());
+    }
+
     if (!tableData || !Array.isArray(tableData.content) || !tableData.content.length) {
       throw new Error('未解析出表格内容');
     }

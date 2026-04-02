@@ -1243,7 +1243,7 @@ export default class AttachesTool {
       errorMessage: config.errorMessage || 'File upload failed',
       uploader: config.uploader || undefined,
       additionalRequestHeaders: config.additionalRequestHeaders || {},
-      // QNotes 扩展：PDF 解析（Docling）
+      // QNotes 扩展：Docling 文档解析
       parseEndpoint: config.parseEndpoint || '',
       parseButtonText: config.parseButtonText || '解析',
       parseLoadingText: config.parseLoadingText || '解析中…',
@@ -1337,8 +1337,10 @@ export default class AttachesTool {
     }
   }
 
-  isPdfAttachment() {
-    return this.getAttachmentExtension() === 'pdf';
+  isDoclingAttachment() {
+    const extension = this.getAttachmentExtension();
+
+    return extension === 'pdf' || extension === 'doc' || extension === 'docx';
   }
 
   isTableAttachment() {
@@ -1351,7 +1353,7 @@ export default class AttachesTool {
       return true;
     }
 
-    return this.isPdfAttachment() && typeof this.config.parseEndpoint === 'string' && this.config.parseEndpoint.trim() !== '';
+    return this.isDoclingAttachment() && typeof this.config.parseEndpoint === 'string' && this.config.parseEndpoint.trim() !== '';
   }
 
   /**
@@ -1634,7 +1636,7 @@ export default class AttachesTool {
 
     this.nodes.wrapper.appendChild(fileInfo);
 
-    // QNotes 扩展：如果是 PDF，显示“解析”按钮（由服务端调用 Docling，返回 blocks 后插入当前笔记）
+    // QNotes 扩展：如果是 Docling 支持的文档，显示“解析”按钮（返回 blocks 后插入当前笔记）
     try {
       const canParse = !this.readOnly && this.isParseableAttachment();
       if (canParse) {
@@ -1680,7 +1682,7 @@ export default class AttachesTool {
   }
 
   /**
-   * Parse current PDF attachment into Editor.js blocks via QNotes backend.
+   * Parse current Docling-supported attachment into Editor.js blocks via QNotes backend.
    */
   async onParsePdfClick() {
     if (this._isParsingPdf) return;
@@ -1765,7 +1767,7 @@ export default class AttachesTool {
       }
 
       this.api.notifier.show({
-        message: 'PDF 解析完成，已插入到笔记中',
+        message: '文档解析完成，已插入到笔记中',
         style: 'success',
       });
     } catch (e) {
@@ -1836,7 +1838,7 @@ export default class AttachesTool {
     throw new Error('Unable to locate current block');
   }
 
-  async parsePdfAttachment() {
+  async parseDoclingAttachment() {
     const parseEndpoint = (this.config.parseEndpoint || '').toString().trim();
     if (!parseEndpoint) {
       throw new Error(this.config.parseErrorMessage || 'Parse failed');
@@ -1888,7 +1890,7 @@ export default class AttachesTool {
 
     this.insertBlocksAfterCurrent(blocks);
     this.api.notifier.show({
-      message: 'PDF 解析完成，已插入到笔记中',
+      message: '文档解析完成，已插入到笔记中',
       style: 'success',
     });
   }
@@ -2083,13 +2085,13 @@ export default class AttachesTool {
 
         const tableData = await this.parseTableAttachment();
         await this.insertParsedTable(tableData, targetType);
-      } else if (this.isPdfAttachment()) {
+      } else if (this.isDoclingAttachment()) {
         if (btn) {
           btn.disabled = true;
           btn.textContent = this.config.parseLoadingText || '解析中...';
         }
 
-        await this.parsePdfAttachment();
+        await this.parseDoclingAttachment();
       } else {
         throw new Error('当前附件不支持解析');
       }
